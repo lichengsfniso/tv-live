@@ -1,0 +1,183 @@
+%% ============================================================
+%% 图 1：A — 定时/冷启动刷新订阅源
+%% ============================================================
+sequenceDiagram
+    autonumber
+    participant WM as WorkManager
+    participant Wrk as SignalRefreshWorker
+    participant CO as UpdateCoordinator
+    participant SS as SignalUpdateSettings
+    participant RP as LiveRepository
+    participant PP as PlaylistParser
+    participant SP as SharedPreferences
+    participant LA as LiveActivity
+    participant LP as LivePanel
+
+    WM->>Wrk: doWork 周期到点或冷启动一次性或手动
+    Wrk->>CO: refresh(appContext)
+    CO->>SS: status 读取 autoRefresh intervalHours lastSuccessAt
+    alt 未启用 或 距上次成功 < 30min
+        CO-->>Wrk: SKIPPED 节流
+    else 允许执行
+        CO->>SS: 网络约束由 WorkManager Constraints 判定 WiFiOnly
+        CO->>RP: snapshotStore 备份 live-sources.pre-refresh.json
+        CO->>RP: refreshAllSubscriptions
+        loop 每个已订阅源 最多10个
+            RP->>RP: downloadM3u url LegacyTls 10s15s 最多5跳转 20MB
+            alt 该源失败
+                RP->>RP: 跳过 保留原频道 记 fail
+            else 拉取成功
+                RP->>PP: digest(body)
+                PP-->>RP: digest
+                RP->>SP: live-subscriptions 读原 digest
+                alt digest 相同
+                    RP->>RP: 仅更新 updated 零频道改动
+                else digest 不同
+                    RP->>PP: parse body url effectiveUrl
+                    PP-->>RP: newChannels
+                    RP->>RP: applySubscription activate=false 只换元数据 不改 active
+                    RP->>RP: saveAsync 写 live-sources.json
+                end
+            end
+        end
+        RP-->>CO: SourceResult ok fail added removed
+        CO->>RP: ChannelIdMigrator.migrate 修正 favorites
+        CO->>SS: lastSuccessAt=now lastResultJson consecutiveFailures=0
+        CO-->>Wrk: SUCCESS 或 PARTIAL
+        CO->>LA: onStatusChanged(status)
+        alt livePanel.isPlaying
+            LA->>LA: pendingChannelRefresh=true 延迟生效
+        else 播放空闲
+            LA->>LP: refresh deferCurrentRemoval=true
+        end
+    end
+    Wrk-->>WM: Result.success 或 Result.retry
+    Note over LA,LP: onResume 消费 pendingChannelRefresh 再 refresh
+
+%% ============================================================
+%% 图 2：B — 在线频道表更新（地址可配置，缺省 assets）
+%% ============================================================
+sequenceDiagram
+    autonumber
+    actor U as 用户
+    participant LA as LiveActivity
+    participant SS as SignalUpdateSettings
+    participant YC as YangshipinCatalog
+    participant CO as UpdateCoordinator
+    participant LC as LiveCatalog
+    participant OP as OnlineCatalogParser
+    participant NET as HttpURLConnection
+    participant AF as AtomicFile
+    participant RP as LiveRepository
+    participant LP as LivePanel
+
+    rect rgb(238,246,255)
+    Note over U,CO: 入口① 用户填写或清空地址 双入口 showLiveSetup第4项 / 更新设置按钮
+    U->>LA: promptCatalogUrl 输入 URL 或直接清空
+    LA->>SS: setCatalogUrl(value) 唯一写入口
+    SS->>SS: 写 catalog_url 键 空串即禁用
+    SS->>YC: invalidate 清 onlineCached 与 catalogVersion
+    SS->>CO: reconfigure 幂等重排周期 Worker
+    alt value 非空
+        CO->>CO: refreshCatalogNow 立即拉取 绕过30min节流
+    else value 为空
+        CO->>CO: 不联网 立即回退 assets
+    end
+    end
+
+    LA->>YC: onCreate loadFromDisk 同步无网络 先判 catalog_url 非空
+    alt catalog_url 非空 且 catalog_url_at_cache 相等 且校验通过
+        YC->>AF: 读 yangshipin-channels.online.json
+        AF-->>YC: lastGood
+        YC->>YC: onlineCached=lastGood catalogVersion 同步
+    else catalog_url 为空 或 URL 标记不符 或缓存损坏
+        YC->>YC: no-op 保持 onlineCached=null 用 assets
+    end
+
+    CO->>SS: 读取 catalog_url
+    alt catalog_url 为空 默认
+        CO->>CO: 不联网 仅 assets 生效
+        Note over CO,LC: B 缺省关闭 不阻塞 A/C
+    else 已配置地址
+        CO->>LC: refreshOnline(context)
+        LC->>YC: refreshOnline
+        YC->>YC: 校验 catalog_url_at_cache 是否与当前一致
+        YC->>NET: GET catalog_url LegacyTls 8s10s 最多3跳转 2MB
+        alt 网络失败或报文超限
+            YC-->>CO: CatalogResult enabled=true updated=false reason
+        else 下载成功
+            YC->>OP: parse(json)
+            OP->>OP: schema1 version正 pid唯一 name非空 数量1到2000
+            OP->>OP: sha256(canonical) 对比 checksum
+            alt 校验失败 或 version 小于等于 catalogVersion
+                OP-->>YC: 抛异常 拒绝本次
+                YC->>YC: 保留 lastGood 或 assets 绝不写空
+            else 校验通过
+                OP-->>YC: Parsed version channels
+                YC->>AF: 原子写 yangshipin-channels.online.json
+                YC->>SS: 写 catalog_url_at_cache=当前URL catalog_version=version
+                YC->>YC: onlineCached=channels
+                YC-->>CO: CatalogResult enabled=true updated=true count
+            end
+        end
+    end
+    CO->>SS: lastResultJson 写入 catalog 结果
+    CO->>LC: read(context) 返回 current 即 onlineCached 或 assets
+    LC-->>RP: refreshPlugin 对比后 copy DEFAULT_SOURCE 频道 saveAsync
+    RP->>LP: revision 变化 snapshot 更新 延迟到 idle 再 refresh
+
+%% ============================================================
+%% 图 3：C — 播放失效自动恢复（清缓存 + 重新鉴权 + 切备用线路 + 退避）
+%% ============================================================
+sequenceDiagram
+    autonumber
+    actor U as 用户或播放器
+    participant YP as YangshipinPlayer
+    participant ORM as OfficialRouteMemory
+    participant SR as YangshipinStreamResolver
+    participant SP as SharedPreferences
+    participant JNI as NativeYspSigner so
+    participant HP as HlsProxyServer
+    participant EX as ExoPlayer
+    participant DG as PlaybackDiagnostics
+
+    U->>YP: open 频道 或 播放中黑屏或 onPlayerError
+    YP->>ORM: preferred(pid)
+    ORM-->>YP: preferCctv 默认 false
+    YP->>SR: resolve addr quality forceReload preferCctv callback
+    SR->>SP: 读 official_stream_cache_v3 key pid_quality_route
+    alt 命中且未过期 10min 且非 forceReload
+        SR-->>YP: cachedUrl 不鉴权
+    else 未命中或过期或 forceReload
+        SR->>SR: cancel epoch++ 断开在途连接
+        alt preferCctv 为 true
+            SR->>SR: tryFetchCctvLiveUrl vdnx vdnxbk H5E
+        else 央视频主线路
+            SR->>JNI: tokenRnd guid ts 与 signature
+            JNI-->>SR: 新签名 每次现算
+            SR->>SR: POST player-api auth 与 get_live_info
+        end
+        alt 主线路失败
+            SR->>SR: 自动回退另一线路
+        end
+        SR->>SP: putCache url_ time_
+    end
+    SR->>DG: update officialRoute cctv-fallback 或 yangshipin
+    SR->>ORM: remember pid preferCctvUsed
+    SR-->>YP: Result.success streamUrl
+
+    Note over YP,EX: 播放失败或 statusTick 18s 无画面进展 触发 recover
+    YP->>YP: retries++ 退避 min 1200乘2的n次方 8000 加抖动
+    YP->>SR: invalidatePid(pid) 清该 pid 所有 quality 与 route 的 url 缓存
+    YP->>ORM: remember pid 取反 preferCctv 切备用线路
+    YP->>YP: stopNativePlayer
+    YP->>HP: close 清 segmentCache activeTasks JNI线程上下文
+    YP->>HP: new HlsProxyServer quality proxyUrl url
+    YP->>EX: setMediaSource prepare
+    alt 渲染首帧成功
+        EX-->>YP: onRenderedFirstFrame retries=0
+    else 连续失败达到3次或达退避上限
+        YP->>YP: 停止重连 notifyState 播放异常请重试或换台
+        YP->>DG: update recoveryFailed=true
+    end
+    Note over JNI,HP: 全程不改 com.bu.cc.tv 与 .so 不删 native 运行时状态

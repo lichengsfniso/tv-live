@@ -1,0 +1,30 @@
+# Gradle / build
+.gradle/
+.kotlin/
+**/build/
+local.properties
+gradle-app.setting
+.cxx/
+
+# IDEA / Android Studio
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# OS
+.DS_Store
+Thumbs.db
+*.swp
+
+# 日志与临时文件
+*.log
+*.tmp
+*.bak
+
+# 凭据：绝不入库
+# 注意：app/src/main/assets/legacy-ca.pem 是内置 CA 证书，属于源码必需文件，不受此忽略
+*.jks
+*.keystore
+token.txt

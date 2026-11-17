@@ -1,0 +1,92 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+def playerVersion = '1.4.1'
+
+android {
+    buildFeatures { buildConfig true }          // LivePanel 使用 BuildConfig.DEBUG，必须开
+    namespace 'com.tvbridge.app'                // 保持！与源码 package 一致（见架构文档 §9.1）
+    compileSdk 35
+    buildToolsVersion '35.0.0'
+
+    defaultConfig {
+        applicationId 'com.onetv.live'          // 新身份，可与 OneTV 共存
+        minSdk 19
+        targetSdk 35
+        versionCode 1
+        versionName '1.0'
+        resConfigs "zh", "en"
+        multiDexEnabled true
+        // 构建期可选注入频道表地址；默认空字符串，等价于设置页留空（绝不硬编码任何 URL）
+        buildConfigField "String", "CATALOG_URL", '""'
+    }
+
+    splits {
+        abi {
+            enable true
+            reset()
+            include 'armeabi-v7a', 'arm64-v8a'
+            universalApk true
+        }
+    }
+
+    // 产物文件名统一用 TV Live 品牌名，避免沿用旧的 OneTV 命名
+    applicationVariants.all { variant ->
+        variant.outputs.all { output ->
+            def abiFilter = output.filters.find { it.filterType == 'ABI' }
+            def abiLabel = abiFilter?.identifier ?: '通用版'
+            output.outputFileName = "TV_Live_${abiLabel}.apk"
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions { jvmTarget = '17' }
+
+    buildTypes {
+        release {
+            minifyEnabled false                 // 首版关闭，避免 so/JNI 反射被裁剪
+            shrinkResources false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    // 与源工程一致：排除 conscrypt 的 arm64 JNI（避免与系统冲突）及 x86 库
+    packagingOptions {
+        jniLibs {
+            excludes += ['**/arm64-v8a/libconscrypt_jni.so', '**/x86/**', '**/x86_64/**']
+        }
+    }
+
+    testOptions {
+        unitTests.includeAndroidResources = true
+        unitTests.all {
+            systemProperty 'robolectric.conscryptMode', 'OFF'
+            systemProperty 'robolectric.dependency.repo.url', 'https://repo.maven.apache.org/maven2'
+        }
+    }
+}
+
+dependencies {
+    implementation 'org.conscrypt:conscrypt-android:2.5.3'       // LegacyTls
+    implementation 'androidx.multidex:multidex:2.0.1'            // minSdk19 + multiDex
+    implementation 'androidx.core:core:1.9.0'
+
+    implementation "androidx.media3:media3-exoplayer:${playerVersion}"
+    implementation "androidx.media3:media3-exoplayer-hls:${playerVersion}"
+    implementation "androidx.media3:media3-exoplayer-dash:${playerVersion}"
+    implementation "androidx.media3:media3-exoplayer-rtsp:${playerVersion}"
+    implementation "androidx.media3:media3-exoplayer-smoothstreaming:${playerVersion}"
+    implementation "androidx.media3:media3-ui:${playerVersion}"  // PlayerView
+    implementation 'com.github.anilbeesetti.nextlib:nextlib-media3ext:v0.8.2'
+    // T01：单一后台调度器（周期 + 一次性 + 仅 WiFi 约束 + 重启恢复）
+    implementation 'androidx.work:work-runtime-ktx:2.9.1'
+
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.json:json:20240303'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
+}

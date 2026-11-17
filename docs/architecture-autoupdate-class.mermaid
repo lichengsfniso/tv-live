@@ -1,0 +1,173 @@
+classDiagram
+    class SignalUpdateSettings {
+        <<object / SharedPreferences: signal-update-settings>>
+        + Boolean autoRefresh
+        + Int intervalHours
+        + Boolean wifiOnly
+        + String catalogUrl
+        + String catalogUrlAtCache
+        + Int catalogVersion
+        + Long lastSuccessAt
+        + Int consecutiveFailures
+        + String lastResultJson
+        + setCatalogUrl(value) void
+        + throttled(now, windowMs) Boolean
+        + status() UpdateStatus
+        + addListener(fn) void
+        + notifyStatus(s) void
+    }
+    class UpdateStatus {
+        + State state
+        + Long startedAt
+        + Long finishedAt
+        + SourceResult subscriptions
+        + CatalogResult catalog
+        + String message
+    }
+    class SourceResult {
+        + Int ok
+        + Int fail
+        + Int added
+        + Int removed
+        + List~String~ details
+    }
+    class CatalogResult {
+        + Boolean enabled
+        + Boolean updated
+        + Int version
+        + Int count
+        + String reason
+    }
+    class UpdateCoordinator {
+        <<object / 唯一后台入口>>
+        - UpdateStatus status
+        + refresh(context) UpdateStatus
+        + refreshCatalogNow(context) UpdateStatus
+        + reconfigure(context) void
+        + enqueueNow(context) void
+    }
+    class SignalRefreshWorker {
+        <<WorkManager Worker>>
+        + doWork() Result
+        + enqueuePeriodic(ctx, hours, wifiOnly) void
+        + enqueueNow(ctx) void
+    }
+    class LiveRepository {
+        - MutableList~Source~ sources
+        - MutableSet~String~ favorites
+        - String active
+        - AtomicFile file
+        + subscribe(address) Boolean
+        - downloadM3u(address) String
+        - applySubscription(url, body, activate) Boolean
+        + refreshAllSubscriptions() SourceResult
+        + refreshPlugin() void
+        + snapshot(knownVersion) String
+        + exportStore() String
+        + restoreSnapshot(text) void
+        + replaceFavorites(ids) void
+        + snapshotStore() String
+    }
+    class Source {
+        + String url
+        + String name
+        + List~LiveChannel~ channels
+        + Long updated
+    }
+    class LiveChannel {
+        + String id
+        + String name
+        + String group
+        + List~String~ streams
+    }
+    class ChannelIdMigrator {
+        <<object>>
+        + migrate(newChannels, oldIds, oldChannels) Set~String~
+        + normalize(name) String
+    }
+    class OnlineCatalogParser {
+        <<object>>
+        + parse(json) Parsed
+        - canonical(parsed) String
+    }
+    class Parsed {
+        + Int version
+        + String updatedAt
+        + List~LiveChannel~ channels
+    }
+    class YangshipinCatalog {
+        <<object>>
+        - List~LiveChannel~ assetCached
+        - List~LiveChannel~ onlineCached
+        - Int onlineVersion
+        + channels(assets) List~LiveChannel~
+        + current(assets) List~LiveChannel~
+        + loadFromDisk(context) void
+        + refreshOnline(context) Result
+        + invalidate() void
+    }
+    class LiveCatalog {
+        <<object / 门面>>
+        + channels(context) List~LiveChannel~
+        + read(context) Result
+        + refreshOnline(context) Result
+    }
+    class YangshipinPlayer {
+        - YangshipinStreamResolver resolver
+        - HlsProxyServer proxy
+        - Int retries
+        - Boolean preferCctv
+        + open(address, forceReload) void
+        - recover(changeRoute) void
+        - onPlayerError(error) void
+    }
+    class YangshipinStreamResolver {
+        - SharedPreferences prefs
+        - ConcurrentHashMap~String,CachedUrl~ memoryCache
+        - Long currentEpoch
+        + resolve(address, quality, forceReload, preferCctv, callback) void
+        + invalidatePid(pid) void
+        + invalidate(cacheKey) void
+        + invalidateAll() void
+        + cancel() void
+    }
+    class OfficialRouteMemory {
+        <<object / SharedPreferences: official-routes>>
+        + preferred(pid) Boolean
+        + remember(pid, preferCctv) void
+    }
+    class PlaybackAttempts {
+        + backoffDelayMs(retry, baseMs, maxMs) Long
+        + waitForMedia(bufferingMs, sinceMediaMs) Boolean
+    }
+    class HlsProxyServer {
+        <<内存分片缓存, close() 清空 — 不改>>
+        - SegmentCache segmentCache
+        + close() void
+    }
+    class NativeYspSigner {
+        <<JNI com.bu.cc.tv — 包名/签名不可改>>
+        + tokenRnd(String, String) String
+        + signature(String, String, String) String
+    }
+
+    UpdateCoordinator --> SignalUpdateSettings : 读写配置/状态
+    UpdateCoordinator --> LiveRepository : refreshAllSubscriptions
+    UpdateCoordinator --> LiveCatalog : refreshOnline
+    UpdateCoordinator --> ChannelIdMigrator : 收藏迁移
+    SignalRefreshWorker --> UpdateCoordinator : doWork 调用
+    SignalUpdateSettings --> UpdateCoordinator : setter 触发 reconfigure
+    LiveRepository *-- Source
+    Source *-- LiveChannel
+    LiveRepository ..> ChannelIdMigrator
+    LiveCatalog --> YangshipinCatalog : current / refreshOnline
+    YangshipinCatalog ..> OnlineCatalogParser
+    OnlineCatalogParser --> Parsed
+    YangshipinPlayer --> YangshipinStreamResolver
+    YangshipinPlayer --> OfficialRouteMemory
+    YangshipinPlayer ..> PlaybackAttempts
+    YangshipinPlayer --> HlsProxyServer
+    YangshipinStreamResolver ..> OfficialRouteMemory
+    YangshipinStreamResolver ..> NativeYspSigner : 每次鉴权现算签名
+    UpdateStatus *-- SourceResult
+    UpdateStatus *-- CatalogResult
